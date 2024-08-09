@@ -1,109 +1,211 @@
-# Import the library
-from fastapi import FastAPI
-from geo.Geoserver import Geoserver
-import psycopg2
+from funciones.funciones import *
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+import xml.etree.ElementTree as ET
+from PIL import Image, ImageDraw
+import random
+import json
+import os
 
-from typing import List
-from pydantic import BaseModel
-from sqlalchemy import create_engine, MetaData, Table, select, union_all
-from databases import Database
-
-DATABASE_URL = "postgresql://postgres:admin@localhost:5432/geoportal"
-
-engine = create_engine(DATABASE_URL)
-metadata = MetaData()
-mapas_poligono = Table("mapas_poligono", metadata, autoload_with=engine)
-mapas_linea = Table("mapas_linea", metadata, autoload_with=engine)
-mapas_punto = Table("mapas_punto", metadata, autoload_with=engine)
-
-database = Database(DATABASE_URL)
-
-
-
-#uvicorn createGeoserver:app --reload
+#uvicorn V2createGeoserver:app --reload
+#pm2 start "uvicorn createGeoserver:app --host 0.0.0.0" --name api
 app = FastAPI()
-   
-#FUNCION QUE EJECUTA LA ACCION PARA CARGAR LAS CAPAS EN GEOSERVER, Y ADEMAS ADICIONA EN LA BASE DE DATOS LA INFORMACION CORRESPONDIENTE A LA CAPA
-#se recomienda no dejar espacios en los nombres tanto del archivo como del nombre en el formulario
-@app.get("/{store_name}/{file_Name}/{tipo}")
-def loadLayers(store_name: str, file_Name : str, tipo:str):
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/mapas/{mapas_id}")
+async def read_user(mapas_id: int):       
+    sqlPoligono = f"SELECT mapas_poligono.mapas_id, mapas_poligono.poligono_id, mapas_poligono.nombre, mapas_poligono.estilo, mapas_poligono.borde,poligono.ruta_archivo FROM public.mapas_poligono inner join poligono on mapas_poligono.poligono_id = poligono.id WHERE mapas_poligono.mapas_id = {mapas_id}"
+    sqlLinea = f"SELECT mapas_linea.mapas_id, mapas_linea.linea_id, mapas_linea.nombre, mapas_linea.estilo, mapas_linea.borde,linea.ruta_archivo FROM public.mapas_linea inner join linea on mapas_linea.linea_id = linea.id WHERE mapas_linea.mapas_id = {mapas_id}"
+    sqlPunto = f"SELECT mapas_punto.mapas_id, mapas_punto.punto_id, mapas_punto.nombre, mapas_punto.estilo, mapas_punto.borde,punto.ruta_archivo FROM public.mapas_punto inner join punto on mapas_punto.punto_id = punto.id WHERE mapas_punto.mapas_id = {mapas_id}"
     try:
-        #Conexión a la base de datos
-        connection = psycopg2.connect(
-            host = "localhost",
-            user = "postgres",
-            password = "admin",
-            database = "geoportal",
-            port = "5432" 
-        )
-        connection.autocommit = True        
-        
-        #Insercion de datos a la tabla capas
-        cursor = connection.cursor()
+        cursor = connectBF()
+        cursor.execute(f"{sqlPoligono} UNION {sqlLinea} UNION {sqlPunto};")
+        resultados = cursor.fetchall()
+        resultado_json = []
+        for row in resultados:
+            resultado_json.append({
+                'mapas_id': row[0],
+                'nombre': row[2],
+                'estilo': row[3],
+                'borde': row[4],
+                'ruta_archivo': row[5]
+            })
+        return resultado_json    
+    except Exception as err:
+        return f"Unexpected {err=}, {type(err)=}"
+
+@app.get("/cargaCapas/{file_Name}/{tipo}")
+async def cargaCapas(file_Name : str, tipo:str):
+    
+    ruta_archivo = f"/Capas/{file_Name}.geojson"
+    
+    try:
+        cursor = cursor = connectBF()
         if tipo == "Poligono":
             query = f"""INSERT INTO poligono (nombre, ruta_archivo,tipo) values (%s, %s,'Poligono')"""
         elif tipo == "Linea":
             query = f"""INSERT INTO linea (nombre, ruta_archivo,tipo) values (%s, %s,'Linea')"""
-        else:
+        elif tipo == "Punto":
             query = f"""INSERT INTO punto (nombre, ruta_archivo,tipo) values (%s, %s,'Punto')"""
-            
-        cursor.execute(query, (store_name, file_Name))
-        cursor.close()
-        
-        # Initialize the library
-        geo = Geoserver('http://127.0.0.1:8080/geoserver', username='admin', password='geoserver')
-        # Crear Espacio de trabajo
-        #geo.create_workspace(workspace='demo1')
-        ruta = r"C:/xampp/htdocs/Geoportal/python/"+file_Name
-        #NOTA: El store es el nombre del almacen
-        #Cargar la capa .shp NOTA:Los archivos que se suben deben estar comprimidos en .ZIP
-        geo.create_shp_datastore(path=ruta, store_name={store_name}, workspace='geoportal')
+        else:
+            return "No se ingresó una geometría válida"
 
+        cursor.execute(query, (file_Name, ruta_archivo))
+        cursor.close()
         return "Se guardo exitosamente"
     except Exception as err:
         return f"Unexpected {err=}, {type(err)=}"
-
-
-
-@app.get("/style/{file_Name}")
-def loadStyles(file_Name : str):
-    geo = Geoserver('http://127.0.0.1:8080/geoserver', username='admin', password='geoserver')
     
-    ruta = r"C:/xampp/htdocs/Geoportal/python/"+file_Name
-    nombre = file_Name.split(".")
-    
-    geo.delete_style(style_name=nombre[0], workspace='geoportal')
-    
-    geo.upload_style(path=ruta,workspace='geoportal')
-    geo.publish_style(layer_name=nombre[0], style_name=nombre[0], workspace='geoportal')
 
-
-#------------------------------------------------------------
-#FUNCIONES PARA TRAER LA INFORMACION DE LAS CAPAS EN EL VISOR
-class UserIn(BaseModel):
-    nombre: str
-    estilo: str
-    borde: str
-    #url: str
-
-class UserOut(UserIn):
-    mapas_id: int
-
-@app.on_event("startup")
-async def startup():
-    await database.connect()
-
-@app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
+@app.get("/dataJSON/{capa}")
+def get_json(capa:str):
+    try:
+        JSON = f"/var/www/visor.inn.com.co/public_html/Capas/{capa}.geojson"
+        #JSON = f"C:/xampp/htdocs/Geoportal2/js/visor/{capa}.geojson"
+        with open(JSON, 'r') as JSONOpen:
+            exJSON = json.load(JSONOpen)
+        return exJSON
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     
     
-@app.get("/mapas/{mapas_id}", response_model=List[UserOut])
-async def read_user(mapas_id: int):
-    query = mapas_poligono.select().where(mapas_poligono.c.mapas_id == mapas_id)
-    query2 = mapas_linea.select().where(mapas_linea.c.mapas_id == mapas_id)
-    query3 = mapas_punto.select().where(mapas_punto.c.mapas_id == mapas_id)
-    final_query = union_all(query,query2,query3)
+@app.get("/estiloCategoria/{capa}")
+def getStyle(capa:str):
+    try:
+        JSON = f"/var/www/visor.inn.com.co/public_html/Capas/{capa}.geojson"
+        #JSON = f"C:/xampp/htdocs/Geoportal2/Capas/{capa}.geojson"
+        with open(JSON, 'r') as JSONOpen:
+            exJSON = json.load(JSONOpen)
+            categorias = []
+            for i in exJSON['features']:
+                categorias.append(i['properties'])
 
-    table = await database.fetch_all(final_query)
-    return table
+        return categorias
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/estilos/{nombreArchivo}/{idCapaMapa}/{id}/{tipo}")
+def getStyle(nombreArchivo:str, idCapaMapa:str, id:str, tipo:str):
+    
+    rutaSLD = f"/var/www/visor.inn.com.co/public_html/Estilos/{nombreArchivo}"
+    #rutaSLD =f"C:/Users/Juan Pablo/Downloads/aptitud_arrozsecano_dic2019/Estilos/{nombreArchivo}"
+    rutaLeyenda = f"../../Leyendas/{id}_{idCapaMapa}.png"
+    
+    senJavaScript = ""
+    try:
+        # Abrir y leer el contenido del archivo XML
+        with open(rutaSLD, "r") as file:
+            sld_content = file.read()
+
+        # Analizar el contenido del archivo XML
+        root = ET.fromstring(sld_content)    
+        namespace = {'se': 'http://www.opengis.net/se', 'ogc': 'http://www.opengis.net/ogc'}
+
+        feature =root.find('.//ogc:PropertyName', namespace)
+        values = root.findall('.//se:Description/se:Title', namespace)
+        fills = root.findall('.//se:PolygonSymbolizer/se:Fill/se:SvgParameter[@name="fill"]', namespace)
+
+        #SE DECLARAN DOS ARREGLOS VACÍOS QUE CONTIENEN LOS VALORES DE LOS COLORES Y LOS VALORES DE CADA COLOR
+        colores = []
+        valores = []
+
+        if (feature is None) or (values is None):
+            colores.append(fills[0].text)
+            valores.append("Single Symbol")
+            
+            senJavaScript = f'''var nombre = feature.get('NA'); 
+                    switch (nombre) 
+                    {{case 'Single Symbol':
+                        color = '#FF0000';
+                        break;
+                    default:
+                        color = '{fills[0].text}'; // Gris por defecto
+                    }}'''
+            crearLeyenda(colores, valores, f"{id}_{idCapaMapa}")
+        else:
+            senJavaScript = f'''var nombre = feature.get('{feature.text}'); 
+                        switch (nombre) {{'''
+        
+            for fill, value in zip(fills, values):
+                #AÑADE LOS VALORES DE CADA COLOR Y EL COLOR AL ARRAY CORRESPONDIENTE
+                colores.append(fill.text)
+                valores.append(value.text)
+                
+                senJavaScript = senJavaScript + f'''case '{value.text}':
+                        color = '{fill.text}';
+                        break;'''
+            
+            senJavaScript = senJavaScript+ '''default:
+                        color = '#FF0000'; // Gris por defecto
+                }
+                '''
+            crearLeyenda(colores, valores, f"{id}_{idCapaMapa}")
+            
+        cursor = cursor = connectBF()
+        if tipo == "Poligono":
+            query = f"""UPDATE mapas_poligono SET estilo = %s, borde = %s  WHERE mapas_id = %s AND poligono_id = %s"""
+        elif tipo == "Linea":
+            query = f"""UPDATE mapas_linea SET estilo = %s, borde = %s WHERE mapas_id = %s AND linea_id = %s"""
+        elif tipo == "Punto":
+            query = f"""UPDATE mapas_punto SET estilo = %s, borde = %s WHERE mapas_id = %s AND punto_id = %s"""
+        else:
+            return "No se ingresó una geometría válida"
+
+        cursor.execute(query, (senJavaScript, rutaLeyenda, id,idCapaMapa))
+        cursor.close()
+
+        os.remove(rutaSLD)
+
+        return "Se guardó correctamente"
+    except Exception as err:
+        print(f"Unexpected {err=}, {type(err)=}")
+
+
+@app.get("/crearEstilo/{id}/{id_capa}/{nombre}/{tipo}")
+def crearEstilo(id:str, id_capa:str, nombre:str, tipo:str):
+    try:
+        colors = ['233D4D','FE7F2D','FCCA46','A1C181','619B8A','2191FB','BA274A','841C26','B2ECE1','8CDEDC']
+        
+        estilo = f'''var nombre = feature.get('NA');
+                    switch (nombre) {{
+                    case 'Single Symbol':
+                        color = '#FF0000';
+                        break;
+                    default:
+                        color = '#{colors[random.randint(0, len(colors))]}'; // Gris por defecto
+            }}
+        '''
+                
+        cursor = cursor = connectBF()
+        if tipo == "Poligono":
+            query = f""" INSERT INTO mapas_poligono (mapas_id, poligono_id, nombre, estilo, borde) VALUES (%s, %s, %s, %s, '#000000')"""
+        elif tipo == "Linea":
+            query = f""" INSERT INTO mapas_linea (mapas_id, linea_id, nombre, estilo, borde) VALUES (%s, %s, %s, %s, '#000000')"""
+        elif tipo == "Punto":
+            query = f""" INSERT INTO mapas_punto (mapas_id, punto_id, nombre, estilo, borde) VALUES (%s, %s, %s, %s, '#000000')"""
+        else:
+            return "No se ingresó una geometría válida"
+        
+        cursor.execute(query,(id, id_capa, nombre, estilo))
+        cursor.close()
+        return estilo
+    except Exception as err:
+        print(f"Unexpected {err=}, {type(err)=}")
+        
+def crearLeyenda(fills, values, nameLayer):
+    img = Image.new('RGBA', (150, 150), color=(255, 255, 255, 0))
+    d = ImageDraw.Draw(img)
+    positionText = 5
+    vertical_increment = 30
+    for fill, value in zip(fills,values):
+        d.rectangle([10, positionText, 30, positionText + 20], fill=fill)
+        d.text((40, positionText), value, fill=(0, 0, 0))
+        positionText += vertical_increment
+    img.save(f'/var/www/visor.inn.com.co/public_html/Leyendas/{nameLayer}.png')
